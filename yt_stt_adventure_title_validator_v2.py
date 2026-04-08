@@ -216,7 +216,24 @@ def current_title_matches(row, hero, boss, series_name):
     compact = clean_text(title)
     needed = [clean_text(hero), clean_text(boss), clean_text(series_name)]
     return all(x and x in compact for x in needed)
+def metadata_pair_state(row, hero, boss):
+    metadata_hero = normalize_key(row.get("current_hero", ""))
+    metadata_boss = normalize_key(row.get("current_boss", ""))
+    resolved_hero = normalize_key(hero)
+    resolved_boss = normalize_key(boss)
 
+    supports = (
+        bool(resolved_hero and resolved_boss) and
+        metadata_hero == resolved_hero and
+        metadata_boss == resolved_boss
+    )
+
+    conflicts = (
+        bool(metadata_hero and resolved_hero and metadata_hero != resolved_hero) or
+        bool(metadata_boss and resolved_boss and metadata_boss != resolved_boss)
+    )
+
+    return supports, conflicts
 
 def should_process(row):
     family = (row.get("title_family") or "").strip().lower()
@@ -309,8 +326,9 @@ def main():
             row["final_title"] = final_title
             row["final_description"] = final_description
 
-            title_family = (row.get("title_family") or "").strip().lower()
+                        title_family = (row.get("title_family") or "").strip().lower()
             is_timestamp_family = title_family in {"default_timestamp", "contains_timestamp"}
+            metadata_supports_pair, metadata_conflicts_pair = metadata_pair_state(row, hero, boss)
 
             if hero and boss and current_title_matches(row, hero, boss, series_name):
                 row["verification_status"] = "verified_match"
@@ -320,9 +338,23 @@ def main():
 
             elif hero and boss and final_title:
                 row["verification_status"] = "needs_update"
-                row["verification_reason"] = "inferred_matchup_differs_from_current_title"
 
-                if confidence == "high" and is_timestamp_family:
+                reason_bits = ["inferred_matchup_differs_from_current_title"]
+                if is_timestamp_family:
+                    reason_bits.append("timestamp_family")
+                if metadata_supports_pair:
+                    reason_bits.append("metadata_supports_pair")
+                if metadata_conflicts_pair:
+                    reason_bits.append("metadata_conflicts_pair")
+                if confidence:
+                    reason_bits.append(f"confidence={confidence}")
+
+                row["verification_reason"] = "|".join(reason_bits)
+
+                if metadata_conflicts_pair:
+                    row["needs_review"] = "TRUE"
+                    row["apply"] = "FALSE"
+                elif is_timestamp_family or metadata_supports_pair or confidence in {"high", "medium"}:
                     row["needs_review"] = "FALSE"
                     row["apply"] = "TRUE"
                 else:
@@ -338,7 +370,6 @@ def main():
                 )
                 row["needs_review"] = "TRUE"
                 row["apply"] = "FALSE"
-
             print(f"[{i}/{len(rows)}] {video_id} -> {row['verification_status']} | {hero} vs {boss} | {series_name}")
 
     save_rows(OUTPUT_CSV, rows)
