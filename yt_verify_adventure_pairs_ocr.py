@@ -87,10 +87,13 @@ def fuzzy_hits(text: str, canon_map):
             windows.append(" ".join(tokens[i : i + size]))
 
     for phrase in windows:
+        # exact phrase match against canonical normalized keys
         if phrase in canon_map:
             hits[canon_map[phrase]] += 5
             evidence.append(f"exact:{phrase}")
             continue
+
+        # fuzzy matching
         for key, canon in canon_map.items():
             ratio = SequenceMatcher(None, phrase, key).ratio()
             if phrase in key or key in phrase:
@@ -98,6 +101,7 @@ def fuzzy_hits(text: str, canon_map):
             if ratio >= 0.95:
                 hits[canon] += 3
                 evidence.append(f"fuzzy:{phrase}->{key}:{ratio:.3f}")
+
     return hits, evidence
 
 
@@ -163,6 +167,36 @@ def choose_verified_pair(row, hero_hits: Counter, boss_hits: Counter):
     captured_hero = (row.get("capturedhero") or "").strip()
     captured_boss = (row.get("capturedboss") or "").strip()
 
+    # --- NEW: respect prior verified / trusted pairs -----------------
+    prior_verified_hero = (row.get("verifiedhero") or "").strip()
+    prior_verified_boss = (row.get("verifiedboss") or "").strip()
+    prior_status = (row.get("verifystatus") or "").strip()
+    try:
+        prior_conf = int((row.get("verifyconfidence") or "0").strip() or "0")
+    except ValueError:
+        prior_conf = 0
+
+    # a) Previously verified hero/boss that is legal in directory
+    if (
+        prior_verified_hero
+        and prior_verified_boss
+        and prior_conf >= 70
+        and prior_verified_boss in HERO_TO_BOSSES.get(prior_verified_hero, set())
+    ):
+        return prior_verified_hero, prior_verified_boss, "locked_trusted_pair", max(
+            prior_conf, 95
+        )
+
+    # b) verifystatus says "verified" and current hero/boss is legal
+    if (
+        prior_status == "verified"
+        and current_hero
+        and current_boss
+        and current_boss in HERO_TO_BOSSES.get(current_hero, set())
+    ):
+        return current_hero, current_boss, "locked_trusted_pair", max(prior_conf, 95)
+    # -----------------------------------------------------------------
+
     # 1) If metadata already has a legal pair, trust it
     if current_hero and current_boss and current_boss in HERO_TO_BOSSES.get(
         current_hero, set()
@@ -173,9 +207,11 @@ def choose_verified_pair(row, hero_hits: Counter, boss_hits: Counter):
     if captured_hero and captured_boss and captured_boss in HERO_TO_BOSSES.get(
         captured_hero, set()
     ):
-        score = 70 + hero_hits.get(captured_hero, 0) * 3 + boss_hits.get(
-            captured_boss, 0
-        ) * 3
+        score = (
+            70
+            + hero_hits.get(captured_hero, 0) * 3
+            + boss_hits.get(captured_boss, 0) * 3
+        )
         return captured_hero, captured_boss, "capture_plus_ocr", min(99, score)
 
     # 3) Otherwise, resolve purely from OCR hits + directory legality
@@ -221,6 +257,7 @@ def main():
                 row.setdefault("verifystatus", "missing_video_id")
                 continue
 
+            # ensure verification columns exist
             row.setdefault("verifiedhero", "")
             row.setdefault("verifiedboss", "")
             row.setdefault("verifyconfidence", "")
@@ -230,6 +267,29 @@ def main():
             row.setdefault("verifyevidence", "")
 
             print(f"[ocr] ({idx}/{len(rows)}) video {video_id} ...")
+
+            # --- NEW: early exit for already trusted/locked pairs -----
+            existing_hero = (row.get("verifiedhero") or "").strip()
+            existing_boss = (row.get("verifiedboss") or "").strip()
+            try:
+                existing_conf = int(
+                    (row.get("verifyconfidence") or "0").strip() or "0"
+                )
+            except ValueError:
+                existing_conf = 0
+
+            if (
+                existing_hero
+                and existing_boss
+                and existing_conf >= 70
+                and existing_boss in HERO_TO_BOSSES.get(existing_hero, set())
+            ):
+                # normalize status/source and skip OCR work
+                row["verifystatus"] = row.get("verifystatus") or "verified"
+                row["verifysource"] = row.get("verifysource") or "locked_trusted_pair"
+                processed += 1
+                continue
+            # ----------------------------------------------------------
 
             ocr_texts = []
             hero_hits = Counter()
@@ -242,18 +302,19 @@ def main():
                     text = ocr_image(frame)
                     if text:
                         ocr_texts.append(text)
-                    hv, he = fuzzy_hits(text, HERO_KEYS)
-                    bv, be = fuzzy_hits(text, BOSS_KEYS)
-                    hero_hits.update(hv)
-                    boss_hits.update(bv)
-                    evidence.extend([f"hero:{x}" for x in he])
-                    evidence.extend([f"boss:{x}" for x in be])
+                        hv, he = fuzzy_hits(text, HERO_KEYS)
+                        bv, be = fuzzy_hits(text, BOSS_KEYS)
+                        hero_hits.update(hv)
+                        boss_hits.update(bv)
+                        evidence.extend([f"hero:{x}" for x in he])
+                        evidence.extend([f"boss:{x}" for x in be])
             except Exception as e:
                 evidence.append(f"ocr_error:{e}")
 
             hero, boss, source, confidence = choose_verified_pair(
                 row, hero_hits, boss_hits
             )
+
             row["verifiedhero"] = hero
             row["verifiedboss"] = boss
             row["verifyconfidence"] = str(confidence)
@@ -261,7 +322,9 @@ def main():
             row["verifyocrtext"] = " || ".join(ocr_texts[:20])
             row["verifyevidence"] = " | ".join(evidence[:100])
             row["verifystatus"] = (
-                "verified" if hero and boss and confidence >= 70 else "needs_review"
+                "verified"
+                if hero and boss and confidence >= 70
+                else "needs_review"
             )
 
             processed += 1
